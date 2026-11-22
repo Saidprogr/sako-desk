@@ -1,4 +1,6 @@
 bin/
 obj/
+SakoDesk.Android/bin/
+SakoDesk.Android/obj/
 .vs/
 *.user

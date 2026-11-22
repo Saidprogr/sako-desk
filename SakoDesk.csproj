@@ -8,4 +8,9 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyName>SakoDesk</AssemblyName>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="SakoDesk.Android\**" />
+    <EmbeddedResource Remove="SakoDesk.Android\**" />
+    <None Remove="SakoDesk.Android\**" />
+  </ItemGroup>
 </Project>

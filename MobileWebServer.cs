@@ -202,6 +202,28 @@ namespace SakoDesk
                     using WebSocket ws = WebSocket.CreateFromStream(stream, isServer: true, subProtocol: null, keepAliveInterval: TimeSpan.FromSeconds(15));
                     await HandleWebSocketSessionAsync(ws, client.Client.RemoteEndPoint?.ToString() ?? "Телефон", ct);
                 }
+                else if (lines[0].Contains("GET /SakoDesk.apk", StringComparison.OrdinalIgnoreCase))
+                {
+                    string apkPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "SakoDesk.apk");
+                    if (!File.Exists(apkPath))
+                        apkPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SakoDesk.apk");
+
+                    if (File.Exists(apkPath))
+                    {
+                        byte[] apkBytes = await File.ReadAllBytesAsync(apkPath, ct);
+                        string hdr =
+                            "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: application/vnd.android.package-archive\r\n" +
+                            "Content-Disposition: attachment; filename=\"SakoDesk.apk\"\r\n" +
+                            $"Content-Length: {apkBytes.Length}\r\n" +
+                            "Connection: close\r\n\r\n";
+                        byte[] hdrBytes = Encoding.UTF8.GetBytes(hdr);
+                        await stream.WriteAsync(hdrBytes, 0, hdrBytes.Length, ct);
+                        await stream.WriteAsync(apkBytes, 0, apkBytes.Length, ct);
+                        await stream.FlushAsync(ct);
+                        _log("📲 Файл SakoDesk.apk скачан на телефон!");
+                    }
+                }
                 else
                 {
                     string html = GetMobileHtmlPage(_getDeviceId(), Environment.MachineName);
@@ -604,6 +626,7 @@ namespace SakoDesk
     <div class='id-badge'>ПК: " + machineName + @"<br>ID: " + hostId + @"</div>
     <input type='password' id='passInput' placeholder='Введите пароль с ПК' autocomplete='off'>
     <button class='btn-primary' onclick='doAuth()'>ПОДКЛЮЧИТЬСЯ ➜</button>
+    <a href='/SakoDesk.apk' style='display:block;margin-top:12px;color:#2ed573;font-size:13px;font-weight:bold;text-decoration:none;'>📲 Скачать приложение SakoDesk.apk на Android</a>
     <div id='errMsg'></div>
   </div>
 </div>
