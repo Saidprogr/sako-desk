@@ -1088,6 +1088,9 @@ namespace SakoDesk
                 }
                 catch { }
             });
+
+            // 3. Start background Relay auto-registration loop
+            StartRelayAutoRegisterLoop();
         }
 
         private void UpdateLanPeersList()
@@ -1107,36 +1110,86 @@ namespace SakoDesk
             }
         }
 
-        private async Task RegisterOnRelayAsync()
+        public string TryGetDiscoveredPeerIp(string cleanId)
         {
-            try
+            foreach (var kv in _discoveredPeers)
             {
-                var (host, port) = ParseHostPort(_txtRelayHost.Text, 9871);
-                TcpClient relayClient = new TcpClient();
-                relayClient.NoDelay = true;
-                await relayClient.ConnectAsync(host, port);
+                if (NetworkHelper.NormalizeId(kv.Key) == cleanId)
+                    return kv.Value.ip;
+            }
+            return null;
+        }
 
-                NetworkStream stream = relayClient.GetStream();
-                SemaphoreSlim wLock = new SemaphoreSlim(1, 1);
-                string cleanMyId = NetworkHelper.NormalizeId(_myId);
+        private bool _relayLoopActive = false;
 
-                await PacketIO.SendPacketAsync(stream, wLock, PacketType.RelayRegister, Encoding.UTF8.GetBytes(cleanMyId), _serviceCts.Token);
-                AppendLog($"Зарегистрирован на Relay-сервере {host}:{port} под ID {_myId}. Ожидание клиента...");
+        private void StartRelayAutoRegisterLoop()
+        {
+            if (_relayLoopActive) return;
+            _relayLoopActive = true;
 
-                // Wait for RelayReady when a remote viewer connects to our ID
-                var pkt = await PacketIO.ReadPacketAsync(stream, _serviceCts.Token);
-                if (pkt != null && pkt.Value.type == PacketType.RelayReady)
+            Task.Run(async () =>
+            {
+                while (!_serviceCts.Token.IsCancellationRequested)
                 {
-                    AppendLog("Клиент подключился через Relay-сервер! Запуск сессии...");
-                    _ = Task.Run(() => HandleIncomingHostSessionAsync(relayClient, _serviceCts.Token));
-                    // Re-register for next session
-                    _ = Task.Run(RegisterOnRelayAsync);
+                    bool shouldRegister = false;
+                    string relayEndpoint = "127.0.0.1:9871";
+                    if (IsHandleCreated)
+                    {
+                        Invoke(new Action(() =>
+                        {
+                            shouldRegister = _chkUseRelay.Checked || _localRelay.IsRunning;
+                            relayEndpoint = _txtRelayHost.Text.Trim();
+                        }));
+                    }
+
+                    if (!shouldRegister)
+                    {
+                        await Task.Delay(1500, _serviceCts.Token);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var (host, port) = ParseHostPort(relayEndpoint, 9871);
+                        TcpClient relayClient = new TcpClient();
+                        relayClient.NoDelay = true;
+                        await relayClient.ConnectAsync(host, port);
+
+                        NetworkStream stream = relayClient.GetStream();
+                        SemaphoreSlim wLock = new SemaphoreSlim(1, 1);
+                        string cleanMyId = NetworkHelper.NormalizeId(_myId);
+
+                        await PacketIO.SendPacketAsync(stream, wLock, PacketType.RelayRegister, Encoding.UTF8.GetBytes(cleanMyId), _serviceCts.Token);
+                        AppendLog($"✅ Ваш ID ({_myId}) зарегистрирован на Relay-сервере {host}:{port}. Ожидание клиента...");
+
+                        // Wait until a client connects to our ID through the Relay
+                        var pkt = await PacketIO.ReadPacketAsync(stream, _serviceCts.Token);
+                        if (pkt != null && pkt.Value.type == PacketType.RelayReady)
+                        {
+                            AppendLog("🔗 Клиент подключился через Relay-сервер! Запуск трансляции...");
+                            _ = Task.Run(() => HandleIncomingHostSessionAsync(relayClient, _serviceCts.Token));
+                            // Immediately loop around to register a fresh standby slot on the Relay
+                            continue;
+                        }
+                        else
+                        {
+                            relayClient.Close();
+                        }
+                    }
+                    catch
+                    {
+                        // Relay not reachable yet; retry after 3 seconds
+                    }
+
+                    await Task.Delay(3000, _serviceCts.Token);
                 }
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"Не удалось подключиться к Relay: {ex.Message}");
-            }
+            });
+        }
+
+        private Task RegisterOnRelayAsync()
+        {
+            StartRelayAutoRegisterLoop();
+            return Task.CompletedTask;
         }
 
         // =====================================================================
@@ -1663,25 +1716,40 @@ namespace SakoDesk
                 _client.NoDelay = true;
 
                 string cleanDigits = NetworkHelper.NormalizeId(_targetInput);
+                bool connectedViaRelay = false;
 
                 if (_useRelay)
                 {
                     var (rHost, rPort) = MainForm.ParseHostPort(_relayEndpoint, 9871);
                     _owner.AppendLog($"Подключение к Relay-серверу {rHost}:{rPort} для вызова ID {cleanDigits}...");
-                    await _client.ConnectAsync(rHost, rPort);
-                    _stream = _client.GetStream();
-
-                    await PacketIO.SendPacketAsync(_stream, _writeLock, PacketType.RelayConnect, Encoding.UTF8.GetBytes(cleanDigits), _cts.Token);
-                    var relayResp = await PacketIO.ReadPacketAsync(_stream, _cts.Token);
-                    if (relayResp == null || relayResp.Value.type != PacketType.RelayReady)
+                    try
                     {
-                        string err = relayResp != null ? Encoding.UTF8.GetString(relayResp.Value.payload) : "Relay не ответил";
-                        MessageBox.Show($"Ошибка Relay: {err}", "Sako Desk", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        Close();
-                        return;
+                        await _client.ConnectAsync(rHost, rPort);
+                        _stream = _client.GetStream();
+
+                        await PacketIO.SendPacketAsync(_stream, _writeLock, PacketType.RelayConnect, Encoding.UTF8.GetBytes(cleanDigits), _cts.Token);
+                        var relayResp = await PacketIO.ReadPacketAsync(_stream, _cts.Token);
+                        if (relayResp != null && relayResp.Value.type == PacketType.RelayReady)
+                        {
+                            connectedViaRelay = true;
+                        }
+                        else
+                        {
+                            string err = relayResp != null ? Encoding.UTF8.GetString(relayResp.Value.payload) : "Relay не ответил";
+                            _owner.AppendLog($"⚠ Хост не найден на Relay ({err}). Пробуем прямое подключение по ID / IP...");
+                            _client.Close();
+                            _client = new TcpClient { NoDelay = true };
+                        }
+                    }
+                    catch (Exception rex)
+                    {
+                        _owner.AppendLog($"⚠ Relay недоступен ({rex.Message}). Переход на прямое подключение...");
+                        _client.Close();
+                        _client = new TcpClient { NoDelay = true };
                     }
                 }
-                else
+
+                if (!connectedViaRelay)
                 {
                     // Direct IP or 9-digit LAN ID
                     string hostIp = _targetInput;
@@ -1689,9 +1757,17 @@ namespace SakoDesk
 
                     if (cleanDigits.Length == 9 && !_targetInput.Contains('.'))
                     {
-                        IPAddress resolved = NetworkHelper.TryResolveIdToLanIp(cleanDigits, _myIp);
-                        if (resolved != null)
-                            hostIp = resolved.ToString();
+                        string discoveredIp = _owner.TryGetDiscoveredPeerIp(cleanDigits);
+                        if (!string.IsNullOrEmpty(discoveredIp))
+                        {
+                            hostIp = discoveredIp;
+                        }
+                        else
+                        {
+                            IPAddress resolved = NetworkHelper.TryResolveIdToLanIp(cleanDigits, _myIp);
+                            if (resolved != null)
+                                hostIp = resolved.ToString();
+                        }
                     }
                     else
                     {
